@@ -1,0 +1,8 @@
+{
+"name": "mezaaceroestiben-tech-puente-tienda",
+"version": "1.0.0",
+"description": "Puente entre las apps de la tienda y su repositorio privado de GitHub",
+"main": "index.js",
+"scripts": {"start": "node index.js"},
+"engines": {"node": ">=18"}
+}
