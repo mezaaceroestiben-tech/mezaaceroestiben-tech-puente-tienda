@@ -3,7 +3,7 @@ const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
 
-const VERSION = "1.0.0";
+const VERSION = "1.4.0";
 const PORT = parseInt(process.env.PORT || "10000", 10);
 const GH_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
 const REPO = (process.env.REPO_TIENDA || "").trim();
@@ -457,6 +457,209 @@ function reescribirRelease(o, base) {
   return o;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Codigos de canje (promociones). Se guardan en puente_promos.json (el puente no lo expone).
+// Cupos que ve el publico = total - reservados - canjeados (nunca se muestran cupos inexistentes).
+// ---------------------------------------------------------------------------------------------
+const ARCHIVO_PROMOS = "puente_promos.json";
+const MAX_CUPOS = 20;
+let colaPromos = Promise.resolve();
+function enColaPromos(fn) { const p = colaPromos.then(fn, fn); colaPromos = p.catch(() => {}); return p; }
+async function cambiarPromos(mutar) {
+  return enColaPromos(async () => {
+    for (let i = 0; i < 4; i++) {
+      const f = await leerArchivo(ARCHIVO_PROMOS, true);
+      const data = f.json && Array.isArray(f.json.promos) ? f.json : { promos: [] };
+      data.promos.forEach((p) => { if (!Array.isArray(p.canjeados)) p.canjeados = []; });
+      const res = mutar(data);
+      if (!res || res.error || !res.guardar) return res;
+      const r = await escribirArchivo(ARCHIVO_PROMOS, JSON.stringify(data, null, 1), f.existe ? f.sha : undefined, "Puente: codigos de canje");
+      if (r.status === 200 || r.status === 201) return res;
+      if (r.status !== 409 && r.status !== 422) throw new Error("GitHub respondio " + r.status);
+    }
+    return { error: "No se pudo guardar. Reintenta.", status: 409 };
+  });
+}
+const normCodigo = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+function cuposDe(p) { return Math.max(0, (p.cupos_total | 0) - (p.cupos_reservados | 0) - (Array.isArray(p.canjeados) ? p.canjeados.length : 0)); }
+function vistaPromo(p, admin) {
+  const o = {
+    id: p.id, elemento: p.elemento, alcance: p.alcance, version: p.version || "", activo: p.activo !== false, desactivar_al_agotar: p.desactivar_al_agotar === true, duracion_dias: p.duracion_dias | 0,
+    cupos_total: p.cupos_total, cupos_reservados: p.cupos_reservados | 0,
+    canjeados: Array.isArray(p.canjeados) ? p.canjeados.length : 0, disponibles: p.activo === false ? 0 : cuposDe(p), creado: p.creado,
+  };
+  if (admin) { o.codigo = p.codigo; o.usuarios = (Array.isArray(p.canjeados) ? p.canjeados : []).map((c) => ({ usuario: c.n, fecha: c.f })); }
+  return o;
+}
+function generarCodigoPromo(data) {
+  const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let i = 0; i < 50; i++) {
+    let s = ""; const b = crypto.randomBytes(8);
+    for (let k = 0; k < 8; k++) s += A[b[k] % A.length];
+    const cod = "EM-" + s.slice(0, 4) + "-" + s.slice(4);
+    if (!data.promos.some((p) => normCodigo(p.codigo) === normCodigo(cod))) return cod;
+  }
+  throw new Error("No se pudo generar un codigo unico");
+}
+function avisarBotPromo(p) {
+  const url = (process.env.BOT_URL || "").replace(/\/+$/, ""), sec = process.env.BOT_SECRET || "";
+  if (!url || !sec || typeof fetch !== "function") return;
+  const v = vistaPromo(p, false);
+  fetch(url + "/api/promo/actualizar", {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + sec },
+    body: JSON.stringify({ id: v.id, disponibles: v.disponibles, total: v.cupos_total, activo: v.activo }),
+    signal: AbortSignal.timeout(8000),
+  }).catch(() => {});
+}
+// Duracion del acceso tras canjear: 0 = para siempre; si no, dias contados desde el canje.
+function vencimientoMs(p, c) {
+  const d = (p.duracion_dias | 0);
+  const t = Date.parse(c && c.f);
+  return d > 0 && !isNaN(t) ? t + d * 86400000 : 0;
+}
+function textoCorto(x, max) { return String(x == null ? "" : x).replace(/[\u0000-\u001f]/g, " ").trim().slice(0, max); }
+function entero(x) { const n = Number(x); return Number.isInteger(n) ? n : NaN; }
+
+async function manejarPromos(req, ruta, metodo, u, rol, id, R, E) {
+  const esAdm = rol === "admin" || rol === "propietario";
+  const bot = !!(process.env.BOT_CLAVE && process.env.BOT_CLAVE.length >= 12 && igualSeguro(String(req.headers["x-bot-clave"] || ""), process.env.BOT_CLAVE));
+  const sub = ruta.replace(/^\/puente\/promos\/?/, "");
+  const idq = textoCorto(u.searchParams.get("id"), 40);
+  const leerJson = async (max) => { try { return JSON.parse((await leerCuerpo(req, max)).toString() || "{}"); } catch (e) { return null; } };
+
+  if (sub === "estado" && metodo === "GET") {
+    const f = await leerArchivo(ARCHIVO_PROMOS, false);
+    const p = f.json && (f.json.promos || []).find((x) => x.id === idq);
+    if (!p) return E(404, "No encontrado");
+    return R(200, vistaPromo(p, false));
+  }
+  if (sub === "mis" && metodo === "GET") {
+    if (!id.id) return E(401, "Falta la identificacion de la instalacion.");
+    const f = await leerArchivo(ARCHIVO_PROMOS, false);
+    const ahora = Date.now();
+    const lista = [];
+    for (const p of ((f.json && f.json.promos) || [])) {
+      const c = (Array.isArray(p.canjeados) ? p.canjeados : []).find((x) => x.u === id.id);
+      if (!c) continue;
+      const vence = vencimientoMs(p, c);
+      if (vence && ahora > vence) continue;
+      lista.push({ id: p.id, elemento: p.elemento, alcance: p.alcance, version: p.version || "", duracion_dias: p.duracion_dias | 0, expira_ms: vence });
+    }
+    return R(200, { canjes: lista });
+  }
+  if (sub === "canjear" && metodo === "POST") {
+    if (!id.id) return E(401, "Falta la identificacion de la instalacion.");
+    if (!limite("pc:" + id.id, 10, 600000) || !limite("pcip:" + id.ip, 30, 600000)) return E(429, "Demasiados intentos. Espera unos minutos.");
+    const cu = await leerJson(2048);
+    const cod = normCodigo(cu && cu.codigo);
+    if (cod.length < 6) return E(400, "Escribe el codigo completo.");
+    const res = await cambiarPromos((data) => {
+      const p = data.promos.find((x) => normCodigo(x.codigo) === cod && x.activo !== false);
+      if (!p) return { status: 404, error: "Codigo no valido." };
+      p.canjeados = p.canjeados || [];
+      const previo = p.canjeados.find((c) => c.u === id.id);
+      if (previo) {
+        const v = vencimientoMs(p, previo);
+        if (v && Date.now() > v) return { status: 409, error: "Ya usaste este codigo y su tiempo de acceso termino." };
+        return { ya: true, promo: p, canje: previo };
+      }
+      if (cuposDe(p) <= 0) return { status: 410, error: "Los cupos de este codigo se agotaron." };
+      p.canjeados.push({ u: id.id, n: textoCorto(id.usuario, 60), f: new Date().toISOString() });
+      if (p.desactivar_al_agotar === true && cuposDe(p) <= 0) p.activo = false;
+      return { guardar: true, promo: p, canje: p.canjeados[p.canjeados.length - 1] };
+    });
+    if (res.error) return E(res.status || 400, res.error);
+    if (!res.ya) avisarBotPromo(res.promo);
+    return R(200, { ok: true, ya_canjeado: !!res.ya, elemento: res.promo.elemento, alcance: res.promo.alcance, version: res.promo.version || "", disponibles: cuposDe(res.promo), duracion_dias: res.promo.duracion_dias | 0, expira_ms: vencimientoMs(res.promo, res.canje) });
+  }
+  if (sub === "ver" && metodo === "POST") {
+    if (!esAdm && !bot) return E(403, "Solo el bot o un administrador.");
+    const cu = await leerJson(2048);
+    const f = await leerArchivo(ARCHIVO_PROMOS, true);
+    const p = f.json && (f.json.promos || []).find((x) => x.id === textoCorto(cu && cu.id, 40));
+    if (!p) return E(404, "No encontrado");
+    const d = p.activo === false ? 0 : cuposDe(p);
+    return R(200, d > 0 ? { agotado: false, codigo: p.codigo, disponibles: d, total: p.cupos_total, elemento: p.elemento } : { agotado: true, disponibles: 0, total: p.cupos_total });
+  }
+
+  if (!esAdm) return E(403, "Necesitas la clave de administrador del puente.");
+  if (sub === "" && metodo === "GET") {
+    const f = await leerArchivo(ARCHIVO_PROMOS, true);
+    return R(200, { promos: ((f.json && f.json.promos) || []).map((p) => vistaPromo(p, true)) });
+  }
+  if (sub === "" && metodo === "POST") {
+    const cu = await leerJson(8192);
+    if (!cu) return E(400, "Cuerpo no valido");
+    const el = cu.elemento || {};
+    const nombre = textoCorto(el.nombre, 120);
+    if (!nombre) return E(400, "Falta el nombre del elemento.");
+    const total = entero(cu.cupos_total), reserv = cu.cupos_reservados === undefined ? 0 : entero(cu.cupos_reservados);
+    if (!(total >= 1 && total <= MAX_CUPOS)) return E(400, "Los cupos van de 1 a " + MAX_CUPOS + ".");
+    if (!(reserv >= 0 && reserv <= total)) return E(400, "Los cupos reservados no pueden pasar del total.");
+    const alcance = cu.alcance === "actualizacion" ? "actualizacion" : "lanzamiento";
+    const dur = cu.duracion_dias === undefined ? 0 : entero(cu.duracion_dias);
+    if (!(dur >= 0 && dur <= 365)) return E(400, "La duracion va de 0 (para siempre) a 365 dias.");
+    const res = await cambiarPromos((data) => {
+      if (data.promos.length >= 500) return { status: 400, error: "Demasiados codigos guardados. Borra los viejos." };
+      let codigo = cu.codigo ? textoCorto(cu.codigo, 30).toUpperCase() : "";
+      if (codigo && (normCodigo(codigo).length < 6 || data.promos.some((p) => normCodigo(p.codigo) === normCodigo(codigo)))) return { status: 409, error: "Ese codigo no sirve o ya existe." };
+      if (!codigo) codigo = generarCodigoPromo(data);
+      const p = {
+        id: "p" + Date.now().toString(36) + crypto.randomBytes(3).toString("hex"), codigo,
+        elemento: { nombre, categoria: textoCorto(el.categoria, 40), tienda: textoCorto(el.tienda, 80), autor: textoCorto(el.autor, 80) },
+        alcance, version: textoCorto(cu.version, 40), cupos_total: total, cupos_reservados: reserv, canjeados: [],
+        activo: true, desactivar_al_agotar: cu.desactivar_al_agotar === true, duracion_dias: dur, creado: new Date().toISOString(), creado_por: textoCorto(id.usuario, 60),
+      };
+      data.promos.push(p);
+      return { guardar: true, promo: p };
+    });
+    if (res.error) return E(res.status || 400, res.error);
+    return R(201, vistaPromo(res.promo, true));
+  }
+  if (sub === "" && metodo === "PATCH") {
+    const cu = await leerJson(8192);
+    if (!cu) return E(400, "Cuerpo no valido");
+    const res = await cambiarPromos((data) => {
+      const p = data.promos.find((x) => x.id === idq);
+      if (!p) return { status: 404, error: "No encontrado" };
+      const usados = (p.canjeados || []).length;
+      const total = cu.cupos_total === undefined ? p.cupos_total : entero(cu.cupos_total);
+      const reserv = cu.cupos_reservados === undefined ? (p.cupos_reservados | 0) : entero(cu.cupos_reservados);
+      if (!(total >= 1 && total <= MAX_CUPOS)) return { status: 400, error: "Los cupos van de 1 a " + MAX_CUPOS + "." };
+      if (!(reserv >= 0)) return { status: 400, error: "Reservados no valido." };
+      if (reserv + usados > total) return { status: 400, error: "Reservados + canjeados (" + (reserv + usados) + ") no pueden pasar del total (" + total + ")." };
+      p.cupos_total = total; p.cupos_reservados = reserv;
+      if (typeof cu.activo === "boolean") p.activo = cu.activo;
+      if (typeof cu.desactivar_al_agotar === "boolean") p.desactivar_al_agotar = cu.desactivar_al_agotar;
+      if (cu.duracion_dias !== undefined) {
+        const dd = entero(cu.duracion_dias);
+        if (!(dd >= 0 && dd <= 365)) return { status: 400, error: "La duracion va de 0 (para siempre) a 365 dias." };
+        p.duracion_dias = dd;
+      }
+      if (cu.alcance === "lanzamiento" || cu.alcance === "actualizacion") p.alcance = cu.alcance;
+      if (cu.version !== undefined) p.version = textoCorto(cu.version, 40);
+      if (cu.regenerar === true) p.codigo = generarCodigoPromo(data);
+      return { guardar: true, promo: p };
+    });
+    if (res.error) return E(res.status || 400, res.error);
+    avisarBotPromo(res.promo);
+    return R(200, vistaPromo(res.promo, true));
+  }
+  if (sub === "" && metodo === "DELETE") {
+    const res = await cambiarPromos((data) => {
+      const i = data.promos.findIndex((x) => x.id === idq);
+      if (i < 0) return { status: 404, error: "No encontrado" };
+      const [p] = data.promos.splice(i, 1);
+      p.activo = false;
+      return { guardar: true, promo: p };
+    });
+    if (res.error) return E(res.status || 400, res.error);
+    avisarBotPromo(res.promo);
+    return R(200, { ok: true });
+  }
+  return E(405, "Metodo no permitido");
+}
+
 async function manejar(req, res) {
   const u = new URL(req.url, "http://x");
   const ruta = decodeURIComponent(u.pathname);
@@ -477,6 +680,8 @@ async function manejar(req, res) {
   const fin = (status, nota) => { reg.estado = status; if (nota) reg.nota = nota; if (esEscritura || status >= 400) auditar(reg); };
   const R = (status, cuerpo, cab, nota) => { fin(status, nota); return responder(res, status, cuerpo, cab); };
   const E = (status, m) => R(status, { message: m }, null, m);
+
+  if (ruta === "/puente/promos" || ruta.startsWith("/puente/promos/")) return manejarPromos(req, ruta, (metodo === "POST" && String(u.searchParams.get("metodo") || "").toUpperCase() === "PATCH") ? "PATCH" : metodo, u, rol, id, R, E);
 
   if (ruta === "/puente/info") return R(200, { version: VERSION, rol, nombre: quien.nombre, repo: REPO, claveInvalida: !!quien.claveInvalida });
 
@@ -658,13 +863,24 @@ async function descargaAsset(idAsset, R, E) {
   if (r.status === 404) return E(404, "Archivo no encontrado");
   return E(502, "GitHub respondio " + r.status);
 }
+// Las descargas solo redirigen a una dirección firmada de GitHub (los bytes NO pasan por este
+// servidor). Se recuerda 60 s qué archivos tiene cada release para no consultar GitHub en cada descarga.
+const cacheEtiquetas = new Map();
 async function descargaPorEtiqueta(req, res, tag, archivo, R, E) {
-  const rel = await gh("GET", rutaRepo("/releases/tags/" + encodeURIComponent(tag)));
-  if (rel.status === 404) return E(404, "Release no encontrado");
-  if (rel.status !== 200) return E(502, "GitHub respondio " + rel.status);
-  const o = JSON.parse(rel.buf.toString("utf8"));
-  const a = (o.assets || []).find((x) => x.name === archivo);
-  if (!a) return E(404, "Archivo no encontrado en el release");
+  let activos = null;
+  const hit = cacheEtiquetas.get(tag);
+  if (hit && ahoraMs() - hit.t < 60000) activos = hit.assets;
+  if (!activos) {
+    const rel = await gh("GET", rutaRepo("/releases/tags/" + encodeURIComponent(tag)));
+    if (rel.status === 404) return E(404, "Release no encontrado");
+    if (rel.status !== 200) return E(502, "GitHub respondio " + rel.status);
+    const o = JSON.parse(rel.buf.toString("utf8"));
+    activos = (o.assets || []).map((x) => ({ id: x.id, name: x.name }));
+    if (cacheEtiquetas.size > 300) cacheEtiquetas.clear();
+    cacheEtiquetas.set(tag, { t: ahoraMs(), assets: activos });
+  }
+  const a = activos.find((x) => x.name === archivo);
+  if (!a) { cacheEtiquetas.delete(tag); return E(404, "Archivo no encontrado en el release"); }
   return descargaAsset(String(a.id), R, E);
 }
 
@@ -749,5 +965,5 @@ if (require.main === module) {
     if (CLAVE_PROPIETARIO.length < 12) console.log("AVISO: CLAVE_PROPIETARIO debe tener al menos 12 caracteres; sin ella no hay propietario.");
   });
 }
-module.exports = { servidor, _p: { deepEqual, soloAgrega, guardia } };
+module.exports = { servidor, _p: { deepEqual, soloAgrega, guardia, cuposDe } };
 
